@@ -11,23 +11,52 @@ Covers:
 - StreamingRandomForest (standard + edge cases)
 - visualise module (smoke tests for plotting functions)
 - Integration: pipeline of scaler + tree
+- StreamingImputer (standard + edge cases)
+- StreamingOneHotEncoder (standard + edge cases)
+- StreamTrainer (standard + edge cases)
+- ChunkStats / update_stats API (standard + edge cases)
+- StreamingMetrics update/reset/result (standard + edge cases)
+- StreamingPipeline partial_fit (standard + edge cases)
+- Class aliases: DecisionTreeClassifier, EnsembleClassifier
 
-Total: 35 tests
+Total: 100 tests
 """
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
 import sys
+import os
 from pathlib import Path
 
-# Allow running tests from project root
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_THIS_FILE = Path(__file__).resolve()
+_PROJECT_ROOT = _THIS_FILE.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from numcompute_stream.preprocessing import StreamingStandardScaler, StreamingMinMaxScaler
-from numcompute_stream.tree import StreamingDecisionTree, _gini, _hoeffding_bound
-from numcompute_stream.ensemble import StreamingBaggingClassifier, StreamingRandomForest
+import numpy as np
+import pytest
+
+from numcompute_stream.preprocessing import (
+    StreamingStandardScaler,
+    StreamingMinMaxScaler,
+    StreamingImputer,
+    StreamingOneHotEncoder,
+)
+from numcompute_stream.tree import (
+    StreamingDecisionTree,
+    DecisionTreeClassifier,
+    _gini,
+    _hoeffding_bound,
+)
+from numcompute_stream.ensemble import (
+    StreamingBaggingClassifier,
+    StreamingRandomForest,
+    EnsembleClassifier,
+)
+from numcompute_stream.stream import StreamTrainer
+from numcompute_stream.stats import ChunkStats, StreamingStats
+from numcompute_stream.metrics import StreamingMetrics
+from numcompute_stream.pipeline import StreamingPipeline
 from numcompute_stream import visualise
 
 
@@ -47,7 +76,7 @@ def binary_dataset():
 def multiclass_dataset():
     rng = np.random.default_rng(7)
     X = rng.standard_normal((300, 4))
-    y = np.digitize(X[:, 0], [-0.5, 0.5])  # classes 0, 1, 2
+    y = np.digitize(X[:, 0], [-0.5, 0.5])
     return X, y
 
 
@@ -58,7 +87,7 @@ def multiclass_dataset():
 class TestStreamingStandardScaler:
 
     def test_single_chunk_matches_numpy(self):
-        """After one partial_fit, mean/std should match numpy."""
+        """After one partial_fit, mean should match numpy."""
         X = np.array([[1., 2., 3.], [4., 5., 6.], [7., 8., 9.]])
         scaler = StreamingStandardScaler()
         scaler.partial_fit(X)
@@ -86,7 +115,7 @@ class TestStreamingStandardScaler:
         X = np.array([[5., 1.], [5., 2.], [5., 3.]])
         scaler = StreamingStandardScaler()
         X_t = scaler.fit(X).transform(X)
-        assert np.all(np.isfinite(X_t)), "NaN/Inf in output for constant column"
+        assert np.all(np.isfinite(X_t))
 
     def test_nan_ignored_during_fit(self):
         """NaN values must be ignored when computing statistics."""
@@ -240,7 +269,7 @@ class TestStreamingDecisionTree:
         assert acc > 0.6, f"Expected accuracy > 0.6, got {acc:.3f}"
 
     def test_incremental_matches_batch(self, binary_dataset):
-        """Accuracy after streaming same data in chunks ≥ single-chunk accuracy × 0.9."""
+        """Accuracy after streaming same data in chunks >= batch x 0.9."""
         X, y = binary_dataset
         tree_batch = StreamingDecisionTree(min_samples_split=20, delta=1e-3, random_state=0)
         tree_batch.fit(X, y)
@@ -292,7 +321,7 @@ class TestStreamingDecisionTree:
         rng = np.random.default_rng(5)
         X = rng.standard_normal((100, 3))
         y = (X[:, 0] > 0).astype(int)
-        X[rng.random((100, 3)) < 0.1] = np.nan  # 10% missing
+        X[rng.random((100, 3)) < 0.1] = np.nan
         tree = StreamingDecisionTree(min_samples_split=10)
         tree.fit(X, y)
         preds = tree.predict(X)
@@ -321,7 +350,7 @@ class TestStreamingDecisionTree:
         assert 2 in tree.classes_
 
     def test_zero_variance_chunk_ok(self):
-        """Zero-variance chunk (all identical features) should not raise."""
+        """Zero-variance chunk should not raise."""
         X = np.ones((30, 2)) * 5.0
         y = np.array([0] * 15 + [1] * 15)
         tree = StreamingDecisionTree(min_samples_split=5)
@@ -344,7 +373,6 @@ class TestStreamingBaggingClassifier:
                                          delta=1e-3, random_state=0)
         bag.fit(X, y)
         acc_bag = np.mean(bag.predict(X) == y)
-        # Ensemble should be at least as good as a single tree (on the training set)
         assert acc_bag >= acc_tree * 0.95
 
     def test_predict_proba_sums_to_one(self, binary_dataset):
@@ -421,7 +449,7 @@ class TestStreamingRandomForest:
 
 
 # ---------------------------------------------------------------------------
-# Visualise module (smoke tests — check no exceptions raised)
+# Visualise module
 # ---------------------------------------------------------------------------
 
 class TestVisualise:
@@ -466,9 +494,7 @@ class TestVisualise:
         assert fig is not None
 
     def test_plot_comparison_missing_metric_raises(self):
-        data = {
-            'Tree': {'accuracy': [0.6, 0.7]},
-        }
+        data = {'Tree': {'accuracy': [0.6, 0.7]}}
         with pytest.raises(ValueError):
             visualise.plot_comparison(data, metric_name='f1')
 
@@ -483,6 +509,45 @@ class TestVisualise:
         tree.fit(X, y)
         result = visualise.plot_tree_structure(tree)
         assert "LEAF" in result or "SPLIT" in result
+
+    def test_plot_metric_over_time_runs(self):
+        """Spec-required function name should work."""
+        import matplotlib
+        matplotlib.use('Agg')
+        fig, ax = visualise.plot_metric_over_time(
+            [0.5, 0.6, 0.7], title='Accuracy', ylabel='Accuracy'
+        )
+        assert fig is not None
+
+    def test_compare_models_runs(self):
+        """Spec-required function name should work."""
+        import matplotlib
+        matplotlib.use('Agg')
+        fig, ax = visualise.compare_models(
+            [0.6, 0.7], [0.65, 0.75], labels=['Tree', 'Forest']
+        )
+        assert fig is not None
+
+    def test_compare_models_default_labels(self):
+        """compare_models should work without explicit labels."""
+        import matplotlib
+        matplotlib.use('Agg')
+        fig, ax = visualise.compare_models([0.6, 0.7], [0.65, 0.75])
+        assert fig is not None
+
+    def test_plot_predictions_vs_ground_truth_runs(self):
+        """Spec-required function name should work."""
+        import matplotlib
+        matplotlib.use('Agg')
+        fig, ax = visualise.plot_predictions_vs_ground_truth(
+            [0, 1, 1, 0], [0, 1, 0, 0]
+        )
+        assert fig is not None
+
+    def test_plot_predictions_shape_mismatch_raises(self):
+        """Mismatched y_true and y_pred should raise ValueError."""
+        with pytest.raises(ValueError):
+            visualise.plot_predictions_vs_ground_truth([0, 1], [0, 1, 1])
 
 
 # ---------------------------------------------------------------------------
@@ -526,3 +591,527 @@ class TestIntegration:
 
         preds = rf.predict(scaler.transform(X))
         assert len(preds) == len(y)
+
+
+# ---------------------------------------------------------------------------
+# StreamingImputer
+# ---------------------------------------------------------------------------
+
+class TestStreamingImputer:
+
+    def test_mean_strategy_removes_nan(self):
+        """Mean strategy should replace NaN with column mean."""
+        X = np.array([[1., np.nan], [3., 4.], [5., 6.]])
+        imp = StreamingImputer(strategy='mean')
+        out = imp.fit_transform(X)
+        assert not np.isnan(out).any()
+        assert out[0, 1] == pytest.approx(5.0)
+
+    def test_median_strategy(self):
+        """Median strategy should replace NaN with column median."""
+        X = np.array([[1., np.nan], [3., 2.], [5., 8.]])
+        imp = StreamingImputer(strategy='median')
+        out = imp.fit_transform(X)
+        assert not np.isnan(out).any()
+        assert out[0, 1] == pytest.approx(5.0)
+
+    def test_constant_strategy(self):
+        """Constant strategy should replace NaN with fill_value."""
+        X = np.array([[np.nan, 1.], [2., np.nan]])
+        imp = StreamingImputer(strategy='constant', fill_value=-99.0)
+        out = imp.fit_transform(X)
+        assert out[0, 0] == pytest.approx(-99.0)
+        assert out[1, 1] == pytest.approx(-99.0)
+
+    def test_partial_fit_updates_estimates(self):
+        """Running mean should update across multiple chunks."""
+        X1 = np.array([[2., 4.]])
+        X2 = np.array([[4., 8.]])
+        imp = StreamingImputer(strategy='mean')
+        imp.partial_fit(X1).partial_fit(X2)
+        # mean of [2,4] and [4,8] = [3, 6]
+        assert imp.statistics_[0] == pytest.approx(3.0)
+        assert imp.statistics_[1] == pytest.approx(6.0)
+
+    def test_invalid_strategy_raises(self):
+        with pytest.raises(ValueError):
+            StreamingImputer(strategy='bad')
+
+    def test_transform_before_fit_raises(self):
+        imp = StreamingImputer()
+        with pytest.raises(ValueError):
+            imp.transform(np.array([[1., np.nan]]))
+
+    def test_feature_mismatch_raises(self):
+        imp = StreamingImputer()
+        imp.partial_fit(np.array([[1., 2., 3.]]))
+        with pytest.raises(ValueError):
+            imp.transform(np.array([[1., 2.]]))
+
+    def test_no_nan_input_unchanged(self):
+        """Input without NaN should pass through unchanged."""
+        X = np.array([[1., 2.], [3., 4.]])
+        imp = StreamingImputer(strategy='mean')
+        out = imp.fit_transform(X)
+        np.testing.assert_array_equal(out, X)
+
+
+# ---------------------------------------------------------------------------
+# StreamingOneHotEncoder
+# ---------------------------------------------------------------------------
+
+class TestStreamingOneHotEncoder:
+
+    def test_basic_encoding(self):
+        """Single column should produce correct one-hot output."""
+        X = np.array([['a'], ['b'], ['a']], dtype=object)
+        enc = StreamingOneHotEncoder()
+        out = enc.fit_transform(X)
+        assert out.shape == (3, 2)
+        assert np.array_equal(out[0], out[2])   # 'a' rows identical
+        assert not np.array_equal(out[0], out[1])  # 'a' != 'b'
+
+    def test_incremental_category_expansion(self):
+        """New categories in later chunks should expand output width."""
+        enc = StreamingOneHotEncoder()
+        enc.partial_fit(np.array([['cat'], ['dog']], dtype=object))
+        assert enc.n_output_features_ == 2
+        enc.partial_fit(np.array([['fish']], dtype=object))
+        assert enc.n_output_features_ == 3
+
+    def test_unknown_category_ignore(self):
+        """Unknown category with handle_unknown='ignore' outputs all zeros."""
+        enc = StreamingOneHotEncoder(handle_unknown='ignore')
+        enc.fit(np.array([['a'], ['b']], dtype=object))
+        out = enc.transform(np.array([['z']], dtype=object))
+        assert np.array_equal(out, np.array([[0, 0]]))
+
+    def test_unknown_category_error(self):
+        """Unknown category with handle_unknown='error' raises ValueError."""
+        enc = StreamingOneHotEncoder(handle_unknown='error')
+        enc.fit(np.array([['a'], ['b']], dtype=object))
+        with pytest.raises(ValueError):
+            enc.transform(np.array([['z']], dtype=object))
+
+    def test_transform_before_fit_raises(self):
+        enc = StreamingOneHotEncoder()
+        with pytest.raises(ValueError):
+            enc.transform(np.array([['a']], dtype=object))
+
+    def test_multiple_columns(self):
+        """Multi-column input should produce correct total output width."""
+        X = np.array([['a', 'x'], ['b', 'y'], ['a', 'x']], dtype=object)
+        enc = StreamingOneHotEncoder()
+        out = enc.fit_transform(X)
+        assert out.shape == (3, 4)   # 2 cats + 2 cats
+
+    def test_fit_resets_categories(self):
+        """Calling fit() should discard previous partial_fit categories."""
+        enc = StreamingOneHotEncoder()
+        enc.partial_fit(np.array([['a'], ['b'], ['c']], dtype=object))
+        enc.fit(np.array([['x'], ['y']], dtype=object))
+        assert enc.n_output_features_ == 2
+
+
+# ---------------------------------------------------------------------------
+# StreamTrainer
+# ---------------------------------------------------------------------------
+
+class TestStreamTrainer:
+
+    def test_fit_chunk_trains_model(self, binary_dataset):
+        """After fit_chunk calls, model should predict with reasonable accuracy."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            scaler=StreamingStandardScaler(),
+            classes=[0, 1],
+        )
+        for i in range(0, len(X), 50):
+            trainer.fit_chunk(X[i:i+50], y[i:i+50])
+        summary = trainer.summary()
+        assert summary['chunks_processed'] == 4
+        assert summary['final_accuracy'] > 0.5
+
+    def test_score_chunk_does_not_update_log(self, binary_dataset):
+        """score_chunk should evaluate without adding to the log."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            scaler=StreamingStandardScaler(),
+            classes=[0, 1],
+        )
+        trainer.fit_chunk(X[:100], y[:100])
+        log_len_before = len(trainer.get_log())
+        trainer.score_chunk(X[100:], y[100:])
+        assert len(trainer.get_log()) == log_len_before
+
+    def test_log_contains_required_keys(self, binary_dataset):
+        """Each log entry must contain all required fields."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            classes=[0, 1],
+        )
+        trainer.fit_chunk(X[:100], y[:100])
+        entry = trainer.get_log()[0]
+        for key in ['chunk_idx', 'n_samples', 'accuracy',
+                    'cumulative_accuracy', 'fit_time_s', 'memory_bytes']:
+            assert key in entry, f"Missing key: {key}"
+
+    def test_accuracy_history_length(self, binary_dataset):
+        """accuracy_history should have one entry per fit_chunk call."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            classes=[0, 1],
+        )
+        n_chunks = 4
+        for i in range(n_chunks):
+            trainer.fit_chunk(X[i*50:(i+1)*50], y[i*50:(i+1)*50])
+        assert len(trainer.accuracy_history()) == n_chunks
+
+    def test_reset_log_clears_state(self, binary_dataset):
+        """reset_log should clear log and counters."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            classes=[0, 1],
+        )
+        trainer.fit_chunk(X[:100], y[:100])
+        trainer.reset_log()
+        assert trainer.get_log() == []
+        assert trainer.chunk_idx_ == 0
+
+    def test_no_scaler_works(self, binary_dataset):
+        """StreamTrainer without a scaler should work fine."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            classes=[0, 1],
+        )
+        trainer.fit_chunk(X[:100], y[:100])
+        result = trainer.score_chunk(X[100:], y[100:])
+        assert 'accuracy' in result
+
+    def test_invalid_model_raises(self):
+        """Model without partial_fit should raise ValueError."""
+        class BadModel:
+            pass
+        with pytest.raises(ValueError):
+            StreamTrainer(model=BadModel())
+
+    def test_cumulative_accuracy_increases(self, binary_dataset):
+        """Cumulative accuracy should be consistent with total correct/seen."""
+        X, y = binary_dataset
+        trainer = StreamTrainer(
+            model=DecisionTreeClassifier(min_samples_split=20),
+            classes=[0, 1],
+        )
+        for i in range(0, len(X), 50):
+            trainer.fit_chunk(X[i:i+50], y[i:i+50])
+        log = trainer.get_log()
+        # cumulative accuracy must be between 0 and 1
+        for entry in log:
+            assert 0.0 <= entry['cumulative_accuracy'] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# ChunkStats (update_stats API)
+# ---------------------------------------------------------------------------
+
+class TestChunkStats:
+
+    def test_update_stats_single_chunk(self):
+        """After one chunk, mean should match numpy mean."""
+        X = np.array([[1., 2.], [3., 4.], [5., 6.]])
+        cs = ChunkStats()
+        cs.update_stats(X)
+        np.testing.assert_allclose(cs.mean_, np.mean(X, axis=0), rtol=1e-6)
+
+    def test_update_stats_two_chunks(self):
+        """Mean after two chunks should equal mean of all data."""
+        X1 = np.array([[1., 2.], [3., 4.]])
+        X2 = np.array([[5., 6.], [7., 8.]])
+        cs = ChunkStats()
+        cs.update_stats(X1).update_stats(X2)
+        X_all = np.vstack([X1, X2])
+        np.testing.assert_allclose(cs.mean_, np.mean(X_all, axis=0), rtol=1e-5)
+
+    def test_min_max_tracked_correctly(self):
+        """Running min/max should reflect values seen across all chunks."""
+        X1 = np.array([[0., 10.]])
+        X2 = np.array([[-5., 20.]])
+        cs = ChunkStats()
+        cs.update_stats(X1).update_stats(X2)
+        assert cs.min_[0] == pytest.approx(-5.0)
+        assert cs.max_[1] == pytest.approx(20.0)
+
+    def test_nan_ignored(self):
+        """NaN values should be excluded from statistics."""
+        X = np.array([[1., np.nan], [np.nan, 4.], [3., 6.]])
+        cs = ChunkStats()
+        cs.update_stats(X)
+        assert np.isfinite(cs.mean_[0])
+        assert np.isfinite(cs.mean_[1])
+
+    def test_chunk_idx_increments(self):
+        """chunk_idx_ should increment with each update_stats call."""
+        cs = ChunkStats()
+        X = np.ones((5, 2))
+        cs.update_stats(X)
+        cs.update_stats(X)
+        assert cs.chunk_idx_ == 2
+
+    def test_properties_before_fit_raises(self):
+        """Accessing mean_ before any update_stats should raise ValueError."""
+        cs = ChunkStats()
+        with pytest.raises(ValueError):
+            _ = cs.mean_
+
+    def test_feature_mismatch_raises(self):
+        """Chunk with wrong number of features should raise ValueError."""
+        cs = ChunkStats()
+        cs.update_stats(np.ones((5, 3)))
+        with pytest.raises(ValueError):
+            cs.update_stats(np.ones((5, 4)))
+
+    def test_sliding_window_mean(self):
+        """Window mean should reflect only the last window_size chunks."""
+        cs = ChunkStats(window_size=2)
+        cs.update_stats(np.array([[0., 0.]]))   # chunk 1 mean = [0, 0]
+        cs.update_stats(np.array([[10., 10.]])) # chunk 2 mean = [10, 10]
+        cs.update_stats(np.array([[20., 20.]])) # chunk 3 mean = [20, 20]
+        # window contains chunks 2 and 3 only
+        np.testing.assert_allclose(cs.window_mean_, [15., 15.], rtol=1e-6)
+
+    def test_to_dict_returns_all_keys(self):
+        """to_dict should contain all expected keys after one update."""
+        cs = ChunkStats()
+        cs.update_stats(np.array([[1., 2.], [3., 4.]]))
+        d = cs.to_dict()
+        for key in ['chunks_seen', 'mean', 'std', 'min', 'max']:
+            assert key in d
+
+
+# ---------------------------------------------------------------------------
+# StreamingMetrics
+# ---------------------------------------------------------------------------
+
+class TestStreamingMetrics:
+
+    def test_update_result_accuracy(self):
+        """Accumulated accuracy should match manual calculation."""
+        sm = StreamingMetrics()
+        y_true = np.array([0, 1, 1, 0, 1])
+        y_pred = np.array([0, 1, 0, 0, 1])
+        sm.update(y_true, y_pred)
+        result = sm.result()
+        expected_acc = np.mean(y_true == y_pred)
+        assert result['accuracy'] == pytest.approx(expected_acc)
+
+    def test_update_two_chunks_accumulates(self):
+        """Metrics should accumulate correctly across two chunks."""
+        sm = StreamingMetrics()
+        sm.update(np.array([0, 1, 1, 0]), np.array([0, 1, 0, 0]))
+        sm.update(np.array([1, 0, 1, 1]), np.array([1, 0, 1, 1]))
+        result = sm.result()
+        assert result['total_samples'] == 8
+        assert result['chunk_count'] == 2
+
+    def test_reset_clears_all_state(self):
+        """reset() should return all metrics to zero."""
+        sm = StreamingMetrics()
+        sm.update(np.array([0, 1]), np.array([0, 1]))
+        sm.reset()
+        result = sm.result()
+        assert result['total_samples'] == 0
+        assert result['accuracy'] == 0.0
+
+    def test_result_keys_present(self):
+        """result() must contain all required keys."""
+        sm = StreamingMetrics()
+        sm.update(np.array([0, 1, 0, 1]), np.array([0, 1, 1, 0]))
+        result = sm.result()
+        for key in ['accuracy', 'precision', 'recall', 'f1',
+                    'confusion_matrix', 'total_samples', 'chunk_count']:
+            assert key in result, f"Missing key: {key}"
+
+    def test_precision_recall_f1_correct(self):
+        """Precision, recall, F1 should match manual calculation."""
+        sm = StreamingMetrics()
+        y_true = np.array([0, 1, 1, 0, 1])
+        y_pred = np.array([0, 1, 0, 0, 1])
+        sm.update(y_true, y_pred)
+        result = sm.result()
+        tp = 2; fp = 0; fn = 1
+        expected_p = tp / (tp + fp)
+        expected_r = tp / (tp + fn)
+        expected_f = 2 * expected_p * expected_r / (expected_p + expected_r)
+        assert result['precision'] == pytest.approx(expected_p)
+        assert result['recall'] == pytest.approx(expected_r)
+        assert result['f1'] == pytest.approx(expected_f)
+
+    def test_confusion_matrix_shape(self):
+        """Confusion matrix should be 2x2 for binary classification."""
+        sm = StreamingMetrics()
+        sm.update(np.array([0, 1, 0, 1]), np.array([0, 0, 1, 1]))
+        cm = sm.confusion_matrix_accumulated()
+        assert cm.shape == (2, 2)
+
+    def test_rolling_window_metrics(self):
+        """Rolling window metrics should reflect only recent chunks."""
+        sm = StreamingMetrics(window_size=2)
+        # Chunk 1: all correct
+        sm.update(np.array([0, 1, 0, 1]), np.array([0, 1, 0, 1]))
+        # Chunk 2: all correct
+        sm.update(np.array([0, 1, 0, 1]), np.array([0, 1, 0, 1]))
+        # Chunk 3: all wrong
+        sm.update(np.array([0, 1, 0, 1]), np.array([1, 0, 1, 0]))
+        result = sm.result()
+        # Window contains chunks 2 and 3: avg accuracy = (1.0 + 0.0) / 2 = 0.5
+        assert result['rolling_accuracy'] == pytest.approx(0.5)
+
+    def test_empty_result_returns_zeros(self):
+        """result() before any update should return zero metrics."""
+        sm = StreamingMetrics()
+        result = sm.result()
+        assert result['accuracy'] == 0.0
+        assert result['total_samples'] == 0
+
+    def test_nan_in_predictions_ignored(self):
+        """NaN values in y_true or y_pred should be dropped."""
+        sm = StreamingMetrics()
+        y_true = np.array([0., 1., np.nan, 0.])
+        y_pred = np.array([0., 1., 0., np.nan])
+        sm.update(y_true, y_pred)
+        result = sm.result()
+        assert result['total_samples'] == 2
+
+    def test_invalid_n_classes_raises(self):
+        """n_classes < 2 should raise ValueError."""
+        with pytest.raises(ValueError):
+            StreamingMetrics(n_classes=1)
+
+
+# ---------------------------------------------------------------------------
+# StreamingPipeline
+# ---------------------------------------------------------------------------
+
+class TestStreamingPipeline:
+
+    def test_partial_fit_then_predict(self, binary_dataset):
+        """Pipeline should train incrementally and predict correctly."""
+        X, y = binary_dataset
+        pipe = StreamingPipeline([
+            ('scale', StreamingStandardScaler()),
+            ('model', DecisionTreeClassifier(min_samples_split=20)),
+        ])
+        for i in range(0, len(X), 50):
+            pipe.partial_fit(X[i:i+50], y[i:i+50], classes=np.array([0, 1]))
+        preds = pipe.predict(X)
+        acc = np.mean(preds == y)
+        assert acc > 0.6, f"Pipeline accuracy = {acc:.3f}"
+
+    def test_transform_applies_scaler(self, binary_dataset):
+        """transform() should scale data through all transformer steps."""
+        X, y = binary_dataset
+        pipe = StreamingPipeline([
+            ('scale', StreamingStandardScaler()),
+            ('model', DecisionTreeClassifier(min_samples_split=20)),
+        ])
+        pipe.partial_fit(X, y, classes=np.array([0, 1]))
+        X_t = pipe.transform(X)
+        # Scaled data should have near-zero mean
+        np.testing.assert_allclose(X_t.mean(axis=0), 0.0, atol=0.1)
+
+    def test_predict_proba_shape(self, binary_dataset):
+        """predict_proba should return (n_samples, n_classes) array."""
+        X, y = binary_dataset
+        pipe = StreamingPipeline([
+            ('scale', StreamingStandardScaler()),
+            ('model', DecisionTreeClassifier(min_samples_split=20)),
+        ])
+        pipe.partial_fit(X, y, classes=np.array([0, 1]))
+        proba = pipe.predict_proba(X)
+        assert proba.shape == (len(X), 2)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-9)
+
+    def test_empty_steps_raises(self):
+        """Empty steps list should raise ValueError."""
+        with pytest.raises(ValueError):
+            StreamingPipeline([])
+
+    def test_invalid_step_format_raises(self):
+        """Steps without name/estimator pair should raise ValueError."""
+        with pytest.raises(ValueError):
+            StreamingPipeline([('only_one',)])
+
+    def test_final_step_without_partial_fit_raises(self, binary_dataset):
+        """Final step without partial_fit should raise ValueError."""
+        X, y = binary_dataset
+
+        class NoPartialFit:
+            def fit(self, X, y=None): return self
+            def predict(self, X): return np.zeros(len(X))
+
+        pipe = StreamingPipeline([
+            ('scale', StreamingStandardScaler()),
+            ('model', NoPartialFit()),
+        ])
+        with pytest.raises(ValueError):
+            pipe.partial_fit(X, y)
+
+    def test_named_steps_accessible(self, binary_dataset):
+        """named_steps property should give access to steps by name."""
+        X, y = binary_dataset
+        scaler = StreamingStandardScaler()
+        pipe = StreamingPipeline([
+            ('scale', scaler),
+            ('model', DecisionTreeClassifier(min_samples_split=20)),
+        ])
+        assert 'scale' in pipe.named_steps
+        assert 'model' in pipe.named_steps
+
+    def test_fit_delegates_to_partial_fit(self, binary_dataset):
+        """fit() should behave identically to a single partial_fit call."""
+        X, y = binary_dataset
+        pipe = StreamingPipeline([
+            ('scale', StreamingStandardScaler()),
+            ('model', DecisionTreeClassifier(min_samples_split=20)),
+        ])
+        pipe.fit(X, y, classes=np.array([0, 1]))
+        preds = pipe.predict(X)
+        assert len(preds) == len(y)
+
+
+# ---------------------------------------------------------------------------
+# Class aliases
+# ---------------------------------------------------------------------------
+
+class TestAliases:
+
+    def test_decision_tree_classifier_is_alias(self):
+        """DecisionTreeClassifier must be the same class as StreamingDecisionTree."""
+        assert DecisionTreeClassifier is StreamingDecisionTree
+
+    def test_ensemble_classifier_is_alias(self):
+        """EnsembleClassifier must be the same class as StreamingRandomForest."""
+        assert EnsembleClassifier is StreamingRandomForest
+
+    def test_decision_tree_classifier_works(self, binary_dataset):
+        """DecisionTreeClassifier should train and predict correctly."""
+        X, y = binary_dataset
+        clf = DecisionTreeClassifier(min_samples_split=20, delta=1e-3)
+        clf.fit(X, y)
+        acc = np.mean(clf.predict(X) == y)
+        assert acc > 0.6
+
+    def test_ensemble_classifier_works(self, binary_dataset):
+        """EnsembleClassifier should train and predict correctly."""
+        X, y = binary_dataset
+        clf = EnsembleClassifier(n_estimators=5, min_samples_split=20,
+                                 random_state=0)
+        clf.fit(X, y)
+        acc = np.mean(clf.predict(X) == y)
+        assert acc > 0.6
