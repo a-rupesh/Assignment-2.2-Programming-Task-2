@@ -503,3 +503,12 @@ class StreamingDecisionTree:
                 return 1
             return _count(node.left) + _count(node.right)
         return _count(self.root_)
+
+
+# ---------------------------------------------------------------------------
+# Spec-required alias
+# ---------------------------------------------------------------------------
+
+#: Alias for StreamingDecisionTree matching the spec class name.
+DecisionTreeClassifier = StreamingDecisionTree
+

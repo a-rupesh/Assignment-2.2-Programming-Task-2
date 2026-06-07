@@ -298,3 +298,12 @@ class StreamingRandomForest(StreamingBaggingClassifier):
         if n_valid == 0:
             return np.full((X.shape[0], self.n_classes_), 1.0 / self.n_classes_)
         return proba_sum / n_valid
+
+
+# ---------------------------------------------------------------------------
+# Spec-required alias
+# ---------------------------------------------------------------------------
+
+#: Alias for StreamingRandomForest matching the spec class name.
+EnsembleClassifier = StreamingRandomForest
+

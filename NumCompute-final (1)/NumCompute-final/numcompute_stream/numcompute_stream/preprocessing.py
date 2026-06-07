@@ -252,3 +252,242 @@ class StreamingMinMaxScaler:
     def fit_transform(self, X) -> np.ndarray:
         """Fit then transform in one call."""
         return self.fit(X).transform(X)
+
+
+# ---------------------------------------------------------------------------
+# StreamingImputer — spec-required partial_fit for missing values
+# ---------------------------------------------------------------------------
+
+class StreamingImputer:
+    """Incremental missing-value imputer with partial_fit support.
+
+    Updates missing-value fill estimates on the fly using running statistics.
+
+    Parameters
+    ----------
+    strategy : {'mean', 'median', 'constant'}, default='mean'
+        Imputation strategy.
+        - 'mean'     : replace NaN with running column mean (Welford).
+        - 'median'   : replace NaN with running median approximation.
+        - 'constant' : replace NaN with fill_value.
+    fill_value : float, default=0.0
+        Used when strategy='constant' or when a column is entirely NaN.
+
+    Examples
+    --------
+    >>> imp = StreamingImputer(strategy='mean')
+    >>> imp.partial_fit(np.array([[1., np.nan], [3., 4.]]))
+    >>> imp.transform(np.array([[np.nan, 2.]]))
+    array([[2., 2.]])
+    """
+
+    def __init__(self, strategy: str = 'mean', fill_value: float = 0.0):
+        allowed = {'mean', 'median', 'constant'}
+        if strategy not in allowed:
+            raise ValueError(f"strategy must be one of {sorted(allowed)}.")
+        self.strategy = strategy
+        self.fill_value = float(fill_value)
+        self.statistics_: np.ndarray | None = None
+        self.n_features_in_: int | None = None
+        # For running mean (Welford)
+        self._n: np.ndarray | None = None
+        self._mean: np.ndarray | None = None
+        # For running median (reservoir of recent values per feature)
+        self._reservoir: list | None = None
+        self._reservoir_max = 500
+
+    def _initialise(self, n_features: int) -> None:
+        self.n_features_in_ = n_features
+        self._n = np.zeros(n_features, dtype=float)
+        self._mean = np.zeros(n_features, dtype=float)
+        self._reservoir = [[] for _ in range(n_features)]
+        self.statistics_ = np.full(n_features, self.fill_value)
+
+    def partial_fit(self, X) -> "StreamingImputer":
+        """Update fill estimates with a new chunk.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        self
+        """
+        X = _as_2d_float(X)
+        if self.n_features_in_ is None:
+            self._initialise(X.shape[1])
+        else:
+            _check_features(X, self.n_features_in_)
+
+        if self.strategy == 'constant':
+            self.statistics_ = np.full(self.n_features_in_, self.fill_value)
+            return self
+
+        for f in range(X.shape[1]):
+            col = X[:, f]
+            valid = col[~np.isnan(col)]
+            if len(valid) == 0:
+                continue
+
+            if self.strategy == 'mean':
+                for v in valid:
+                    self._n[f] += 1
+                    delta = v - self._mean[f]
+                    self._mean[f] += delta / self._n[f]
+                self.statistics_[f] = (self._mean[f]
+                                       if self._n[f] > 0
+                                       else self.fill_value)
+
+            elif self.strategy == 'median':
+                self._reservoir[f].extend(valid.tolist())
+                if len(self._reservoir[f]) > self._reservoir_max:
+                    self._reservoir[f] = self._reservoir[f][-self._reservoir_max:]
+                self.statistics_[f] = float(np.median(self._reservoir[f]))
+
+        return self
+
+    def fit(self, X) -> "StreamingImputer":
+        """Reset and fit on a single batch."""
+        self.n_features_in_ = None
+        return self.partial_fit(X)
+
+    def transform(self, X) -> np.ndarray:
+        """Replace NaN values using current fill estimates.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        np.ndarray
+        """
+        if self.statistics_ is None:
+            raise ValueError("Call partial_fit before transform.")
+        X = _as_2d_float(X)
+        _check_features(X, self.n_features_in_)
+        return np.where(np.isnan(X), self.statistics_, X)
+
+    def fit_transform(self, X) -> np.ndarray:
+        """Fit then transform in one call."""
+        return self.fit(X).transform(X)
+
+
+# ---------------------------------------------------------------------------
+# StreamingOneHotEncoder — incremental category expansion
+# ---------------------------------------------------------------------------
+
+class StreamingOneHotEncoder:
+    """One-hot encoder that expands its category set incrementally.
+
+    New categories discovered in later chunks are added automatically,
+    growing the output width. Previously encoded data would need to be
+    re-encoded if used with a wider matrix — this encoder is designed
+    for streaming prediction pipelines where only the current chunk
+    is encoded at a time.
+
+    Parameters
+    ----------
+    handle_unknown : {'ignore', 'error'}, default='ignore'
+        What to do with categories not seen during any partial_fit.
+        Default is 'ignore' (output all zeros) which is safer for streaming.
+
+    Examples
+    --------
+    >>> enc = StreamingOneHotEncoder()
+    >>> enc.partial_fit(np.array([['cat'], ['dog']], dtype=object))
+    >>> enc.partial_fit(np.array([['fish']], dtype=object))  # new category
+    >>> enc.transform(np.array([['cat'], ['fish']], dtype=object))
+    """
+
+    def __init__(self, handle_unknown: str = 'ignore'):
+        if handle_unknown not in {'ignore', 'error'}:
+            raise ValueError("handle_unknown must be 'ignore' or 'error'.")
+        self.handle_unknown = handle_unknown
+        self.categories_: list | None = None
+        self.n_features_in_: int | None = None
+        self.n_output_features_: int = 0
+
+    def partial_fit(self, X) -> "StreamingOneHotEncoder":
+        """Update known categories with a new chunk.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Categorical data.
+
+        Returns
+        -------
+        self
+        """
+        X = np.asarray(X, dtype=object)
+        if X.ndim != 2:
+            raise ValueError("X must be 2D.")
+
+        if self.categories_ is None:
+            self.n_features_in_ = X.shape[1]
+            self.categories_ = [np.array([], dtype=object)
+                                 for _ in range(X.shape[1])]
+
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features; expected {self.n_features_in_}."
+            )
+
+        # Expand categories with any new values
+        for f in range(self.n_features_in_):
+            new_cats = np.setdiff1d(np.unique(X[:, f]), self.categories_[f])
+            if len(new_cats) > 0:
+                self.categories_[f] = np.sort(
+                    np.concatenate([self.categories_[f], new_cats])
+                )
+
+        self.n_output_features_ = sum(len(c) for c in self.categories_)
+        return self
+
+    def fit(self, X) -> "StreamingOneHotEncoder":
+        """Reset and fit on a single batch."""
+        self.categories_ = None
+        self.n_features_in_ = None
+        return self.partial_fit(X)
+
+    def transform(self, X) -> np.ndarray:
+        """Encode X using the current category set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples, n_output_features_)
+        """
+        if self.categories_ is None:
+            raise ValueError("Call partial_fit before transform.")
+        X = np.asarray(X, dtype=object)
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features; expected {self.n_features_in_}."
+            )
+
+        n = X.shape[0]
+        out = np.zeros((n, self.n_output_features_), dtype=int)
+        col_offset = 0
+
+        for f, cats in enumerate(self.categories_):
+            for i, row_val in enumerate(X[:, f]):
+                idx = np.searchsorted(cats, row_val)
+                if idx < len(cats) and cats[idx] == row_val:
+                    out[i, col_offset + idx] = 1
+                elif self.handle_unknown == 'error':
+                    raise ValueError(
+                        f"Unknown category '{row_val}' in feature {f}."
+                    )
+            col_offset += len(cats)
+
+        return out
+
+    def fit_transform(self, X) -> np.ndarray:
+        """Fit then transform in one call."""
+        return self.fit(X).transform(X)

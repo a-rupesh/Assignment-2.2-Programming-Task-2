@@ -381,3 +381,165 @@ def plot_tree_structure(
 
     _render(tree.root_, 0, "")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Spec-required function names
+# ---------------------------------------------------------------------------
+
+def plot_metric_over_time(
+    metric_values,
+    title: str = 'Metric over time',
+    ylabel: str = 'Value',
+    xlabel: str = 'Chunk',
+    figsize: tuple = (9, 4),
+    ax=None,
+    save_path: str | None = None,
+) -> tuple:
+    """Plot a single metric (e.g. accuracy) across streaming chunks.
+
+    This is the spec-required name for plot_metrics() with a single series.
+
+    Parameters
+    ----------
+    metric_values : list of float
+        One value per chunk.
+    title : str
+    ylabel : str
+    xlabel : str
+    figsize : tuple
+    ax : Axes or None
+    save_path : str or None
+
+    Returns
+    -------
+    tuple[Figure, Axes]
+
+    Examples
+    --------
+    >>> plot_metric_over_time([0.6, 0.7, 0.8], title='Accuracy', ylabel='Accuracy')
+    """
+    return plot_metrics(
+        {ylabel: metric_values},
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        figsize=figsize,
+        ax=ax,
+        save_path=save_path,
+    )
+
+
+def compare_models(
+    metric1,
+    metric2,
+    labels: list | None = None,
+    title: str = 'Model comparison',
+    ylabel: str = 'Score',
+    xlabel: str = 'Chunk',
+    figsize: tuple = (9, 4),
+    ax=None,
+    save_path: str | None = None,
+) -> tuple:
+    """Compare two models on streaming metrics.
+
+    This is the spec-required name; wraps plot_metrics() with two series.
+
+    Parameters
+    ----------
+    metric1 : list of float
+        Metric values for the first model.
+    metric2 : list of float
+        Metric values for the second model.
+    labels : list of str or None
+        Names for the two models. Defaults to ['Model 1', 'Model 2'].
+    title : str
+    ylabel : str
+    xlabel : str
+    figsize : tuple
+    ax : Axes or None
+    save_path : str or None
+
+    Returns
+    -------
+    tuple[Figure, Axes]
+
+    Examples
+    --------
+    >>> compare_models([0.6, 0.7], [0.65, 0.75], labels=['Tree', 'Forest'])
+    """
+    if labels is None:
+        labels = ['Model 1', 'Model 2']
+    if len(labels) < 2:
+        raise ValueError("labels must have at least 2 entries.")
+    return plot_metrics(
+        {labels[0]: metric1, labels[1]: metric2},
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        figsize=figsize,
+        ax=ax,
+        save_path=save_path,
+    )
+
+
+def plot_predictions_vs_ground_truth(
+    y_true,
+    y_pred,
+    title: str = 'Predictions vs Ground Truth',
+    figsize: tuple = (9, 4),
+    ax=None,
+    save_path: str | None = None,
+) -> tuple:
+    """Visualise predictions against actual labels for the latest chunk.
+
+    Plots true labels and predicted labels as step lines so differences
+    are immediately visible.
+
+    Parameters
+    ----------
+    y_true : array-like of shape (n_samples,)
+        Ground truth labels.
+    y_pred : array-like of shape (n_samples,)
+        Predicted labels.
+    title : str
+    figsize : tuple
+    ax : Axes or None
+    save_path : str or None
+
+    Returns
+    -------
+    tuple[Figure, Axes]
+
+    Examples
+    --------
+    >>> plot_predictions_vs_ground_truth([0,1,1,0], [0,1,0,0])
+    """
+    import numpy as np
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+
+    fig, ax_obj = _get_ax(ax, figsize)
+    xs = np.arange(len(y_true))
+
+    ax_obj.step(xs, y_true, where='mid', linewidth=1.8,
+                color=_PALETTE[0], label='Ground truth')
+    ax_obj.step(xs, y_pred, where='mid', linewidth=1.8,
+                color=_PALETTE[1], label='Predicted', linestyle='--')
+
+    # Highlight mismatches
+    mismatch = y_true != y_pred
+    if mismatch.any():
+        ax_obj.scatter(xs[mismatch], y_pred[mismatch], color=_PALETTE[2],
+                       zorder=5, s=40, label='Mismatch')
+
+    ax_obj.legend(fontsize=9, framealpha=0.7)
+    _style_ax(ax_obj, title=title, xlabel='Sample index', ylabel='Class')
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    return fig, ax_obj
